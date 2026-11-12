@@ -1394,12 +1394,15 @@ function confirmRecord() {
 el.duoConfirmBtn.addEventListener('click', confirmRecord);
 
 function stepHp(dir) {
+  // 以输入框里的当前数字为基准，避免刚输入的数字被旧血量覆盖
+  const base = readDraft();
+  const next = clampHp(base + dir * CONFIG.HP_STEP);
   if (mode === 'duo') {
-    el.hpInput.value = String(clampHp(readDraft() + dir * CONFIG.HP_STEP));
+    el.hpInput.value = String(next);
     onHpEdited();
     return;
   }
-  hp = clampHp(hp + dir * CONFIG.HP_STEP);
+  hp = next;
   el.hpInput.value = String(hp);
   onHpEdited();
 }
