@@ -402,6 +402,9 @@ const DICT = {
     sSync: '配對成功，正在同步分配…',
     sNoServer: '連不上配對伺服器。請檢查網路後重試，或先玩單人。',
     sLost: '配對連線中斷了，回到首頁重新匹配。',
+    sLinkLost: '連線中斷，正在重連…',
+    sLinkBack: '已重新連線，進度已同步。',
+    sLinkFail: '連線沒能恢復，請回到首頁重新配對。',
     toastPeerStation: '這一站由對方負責。',
     toastNoUrl: n => `「${n}」還沒填網址。`,
     toastReset: '航程已重置，高光回到第一站。',
@@ -453,6 +456,9 @@ const DICT = {
     sSync: '配对成功，正在同步分配…',
     sNoServer: '连不上配对服务器。请检查网络后重试，或先玩单人。',
     sLost: '配对连接中断了，回到首页重新匹配。',
+    sLinkLost: '连线中断，正在重连…',
+    sLinkBack: '已重新连线，进度已同步。',
+    sLinkFail: '连线没能恢复，请回到首页重新配对。',
     toastPeerStation: '这一站由对方负责。',
     toastNoUrl: n => `「${n}」还没填网址。`,
     toastReset: '航程已重置，高光回到第一站。',
@@ -506,6 +512,9 @@ const DICT = {
     sSync: 'Paired. Syncing stop assignments…',
     sNoServer: 'Cannot reach the matchmaking server. Check your network and retry, or play solo.',
     sLost: 'The pairing connection dropped. Returning to the start.',
+    sLinkLost: 'Connection lost. Reconnecting…',
+    sLinkBack: 'Reconnected. Progress synced.',
+    sLinkFail: 'Could not reconnect. Return to the start and pair again.',
     toastPeerStation: 'That stop belongs to your partner.',
     toastNoUrl: n => `No link set for “${n}” yet.`,
     toastReset: 'Voyage reset. The highlight is back on the first stop.',
@@ -591,6 +600,10 @@ let duoIdx = 0;          // 当前站序号，等于已完成站数
 let duoOpen = false;     // 当前站已开打
 let duoOver = null;      // null | 'win' | 'fail'
 let mq = null, partner = null, netState = 'idle', won = false;
+let linkDown = false;          // 断线中，等待重连
+let reconnectTimer = null;
+let firstConnectDone = false;  // 首次连接已建立（之后的 connect 视为重连）
+let lastSyncSent = 0;
 let searchTimer = null;
 let searchKey = 'sConnect';
 
@@ -1027,8 +1040,8 @@ function connectMQ() {
   return new Promise((resolve, reject) => {
     if (typeof mqtt === 'undefined') { reject(new Error('lib')); return; }
     const c = mqtt.connect(MQ_URL, {
-      clientId: MYID, clean: true, reconnectPeriod: 0,
-      connectTimeout: 9000, keepalive: 30
+      clientId: MYID, clean: true, reconnectPeriod: 3000,
+      connectTimeout: 9000, keepalive: 25
     });
     mq = c;
     let settled = false;
@@ -1040,10 +1053,14 @@ function connectMQ() {
     }, 11000);
 
     c.on('connect', () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve();
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+        firstConnectDone = true;
+        return;
+      }
+      if (firstConnectDone) onReconnected();
     });
     c.on('error', (err) => {
       if (settled) return;
@@ -1058,14 +1075,70 @@ function connectMQ() {
       onMqMessage(topic, m);
     });
     c.on('close', () => {
-      if (mode === 'duo' && netState === 'playing' && !won) {
-        showToast(d().sLost);
-        stopPeer();
-        resetDuo();
-        showLobby();
+      if (mode === 'duo' && netState === 'playing' && !duoOver) {
+        linkDown = true;
+        showToast(d().sLinkLost);
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => {
+          if (!linkDown) return;
+          try { c.reconnect(); } catch (e) {}
+        }, 3000);
+        setTimeout(() => { if (linkDown) showToast(d().sLinkFail); }, 45000);
       }
     });
+    c.on('reconnect', () => {
+      if (linkDown) showToast(d().sLinkLost);
+    });
   });
+}
+
+function publishState() {
+  send({ t: 'sync', idx: duoIdx, open: duoOpen, over: duoOver, hp: hp, ts: Date.now() });
+}
+
+function applyPeerState(m) {
+  let adopted = false;
+  const idx = Number.isFinite(m.idx) ? Math.min(Math.max(0, Math.round(m.idx)), TOTAL) : null;
+  if (idx !== null) {
+    if (idx > duoIdx) {
+      duoIdx = idx;
+      duoOpen = !!m.open;
+      if (Number.isFinite(m.hp)) hp = clampHp(m.hp);
+      saveHp(); renderHp(); render();
+      adopted = true;
+      if (idx >= TOTAL && !duoOver) {
+        endDuo((m.over === 'fail' || hp <= 0) ? 'fail' : 'win');
+        adopted = true;
+      }
+    } else if (idx === duoIdx) {
+      if (!!m.open && !duoOpen && !duoOver) { duoOpen = true; render(); adopted = true; }
+      if (m.open && Number.isFinite(m.hp) && !isMyTurn()) { hp = clampHp(m.hp); saveHp(); renderHp(); }
+    }
+  }
+  if (m.over && !duoOver) { endDuo(m.over); adopted = true; }
+  return adopted;
+}
+
+function requestSync(n) {
+  n = n || 0;
+  if (netState !== 'playing' || !partner) return;
+  publishState();
+  if (n < 3) setTimeout(() => requestSync(n + 1), 1500);
+}
+
+function onReconnected() {
+  const wasDown = linkDown;
+  linkDown = false;
+  clearTimeout(reconnectTimer);
+  if (!mq) return;
+  try { mq.subscribe(TOPIC_LOBBY); mq.subscribe(TOPIC_ROOM); } catch (e) {}
+  if (netState === 'playing' && !duoOver) {
+    if (!isMyTurn()) renderHp();
+    requestSync(0);
+    if (wasDown) showToast(d().sLinkBack);
+  } else if (netState === 'waiting' || netState === 'host' || netState === 'guest') {
+    publish(TOPIC_LOBBY, { t: 'join', from: MYID, ts: Date.now() });
+  }
 }
 
 function stopPeer() {
@@ -1202,6 +1275,14 @@ function onRoom(m) {
     } else if (m.t === 'settle') {
       if (typeof m.next !== 'number') return;
       applySettle(m.next, Number.isFinite(m.hp) ? m.hp : hp);
+    } else if (m.t === 'sync' || m.t === 'state') {
+      const adopted = applyPeerState(m);
+      const peerIdx = Number.isFinite(m.idx) ? m.idx : -1;
+      const now = Date.now();
+      if ((adopted || peerIdx < duoIdx || (peerIdx === duoIdx && !!m.open !== duoOpen)) && now - lastSyncSent > 800) {
+        lastSyncSent = now;
+        publishState();
+      }
     } else if (m.t === 'die') {
       endDuo('fail');
     } else if (m.t === 'win') {
@@ -1331,8 +1412,21 @@ el.dieBtn.addEventListener('click', () => {
 });
 
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden) promptSettle();
+  if (document.hidden) return;
+  if (mq && !mq.connected && (netState === 'playing' || netState === 'waiting')) {
+    linkDown = true;
+    try { mq.reconnect(); } catch (e) {}
+  }
+  promptSettle();
 });
+
+if (el.toast) {
+  el.toast.addEventListener('click', () => {
+    if (!linkDown || !mq) return;
+    try { mq.reconnect(); } catch (e) {}
+    showToast(d().sLinkLost);
+  });
+}
 
 el.cancelSearch.addEventListener('click', goHome);
 el.backHome.addEventListener('click', goHome);
