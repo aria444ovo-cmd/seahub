@@ -662,8 +662,9 @@ function syncHpState() {
   const dict = d();
   const locked = mode === 'duo' && (duoOver || isMyTurn() || !duoOpen);
   el.hpInput.disabled = locked;
-  el.hpDown.disabled = locked || hp <= 0;
-  el.hpUp.disabled = locked || hp >= CONFIG.HP_MAX;
+  const curHp = (mode === 'duo' && !locked) ? readDraft() : hp;
+  el.hpDown.disabled = locked || curHp <= 0;
+  el.hpUp.disabled = locked || curHp >= CONFIG.HP_MAX;
   if (el.dieBtn) {
     const show = mode === 'duo' && !duoOver;
     el.dieBtn.classList.toggle('is-hidden', !show);
@@ -1377,6 +1378,7 @@ function onHpEdited() {
     syncHpState();
     return;
   }
+  hp = readDraft();
   saveHp(); renderHp();
 }
 
@@ -1398,6 +1400,7 @@ function stepHp(dir) {
     return;
   }
   hp = clampHp(hp + dir * CONFIG.HP_STEP);
+  el.hpInput.value = String(hp);
   onHpEdited();
 }
 
